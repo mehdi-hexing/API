@@ -1,4 +1,3 @@
-// A default host to use if the user doesn't provide one.
 const DEFAULT_HOST = 'www.cloudflare.com';
 
 export default {
@@ -17,46 +16,41 @@ export default {
       }, 400);
     }
 
-    // --- The Two Crucial Inputs ---
-    // 1. The IP to test, taken from the URL path.
     const ipToTest = path.split(']')[0].replace('[', '').split(':')[0];
-    
-    // 2. The Host/SNI to use, taken from a query parameter. Fallback to a reliable default.
     const hostHeader = url.searchParams.get('host') || DEFAULT_HOST;
-    
-    // The target URL uses the hostHeader, which is essential for the Host and SNI.
     const traceUrl = `https://${hostHeader}/cdn-cgi/trace`;
 
     try {
-      // --- The Definitive Logic, now with correct parameters ---
       const response = await fetch(traceUrl, {
         method: 'GET',
         redirect: 'follow',
-        // This 'cf' object correctly combines the two critical inputs.
         cf: {
-          // It resolves the HOST to the IP you want to test.
           resolveOverride: ipToTest
         }
       });
 
       if (!response.ok) {
-        throw new Error(`Trace request to host '${hostHeader}' failed with status: ${response.status}`);
+        throw new Error(`Trace request failed with status: ${response.status}`);
       }
 
       const traceText = await response.text();
       const traceData = parseTraceText(traceText);
+      const reportedIp = traceData.ip;
+      
+      if (!reportedIp) {
+        throw new Error("Response was successful, but did not contain an IP in the trace data.");
+      }
 
-      // The final validation remains the same: the IP reported by Cloudflare must match the IP we tested.
-      const isVerifiedProxy = traceData.ip === ipToTest;
+      const { areEquivalent, displayTested, displayReported } = compareIps(ipToTest, reportedIp);
 
       return createJsonResponse({
-        success: isVerifiedProxy,
-        tested_ip: ipToTest,
-        used_host: hostHeader,
+        success: true,
+        message: "Request was successfully proxied.",
         details: {
-          is_proxy: isVerifiedProxy,
-          reported_ip_by_trace: traceData.ip || 'N/A',
-          data_center: traceData.colo || 'N/A',
+          tested_ip_address: displayTested,
+          reported_ip_from_trace: displayReported,
+          ips_are_equivalent: areEquivalent,
+          cloudflare_data_center: traceData.colo || 'N/A',
         },
         raw_trace_data: traceData
       }, 200);
@@ -64,16 +58,40 @@ export default {
     } catch (err) {
       return createJsonResponse({
         success: false,
-        tested_ip: ipToTest,
-        used_host: hostHeader,
-        error: "Test failed. The IP may not be a valid proxy for the specified host.",
-        details: err.message
+        message: "Failed to proxy request.",
+        details: {
+            tested_ip_address: ipToTest,
+            used_host_header: hostHeader,
+            error_message: err.message
+        }
       }, 502);
     }
   },
 };
 
-// --- Helper Functions ---
+function compareIps(inputIp, reportedIp) {
+  if (!inputIp || !reportedIp) {
+    return { areEquivalent: false, displayTested: inputIp, displayReported: reportedIp };
+  }
+
+  let normalizedReportedIp = reportedIp;
+  const ipv4MappedPrefix = "::ffff:";
+
+  if (reportedIp.startsWith(ipv4MappedPrefix) && !inputIp.includes(':')) {
+    const potentialIpv4 = reportedIp.substring(ipv4MappedPrefix.length);
+    if (potentialIpv4.includes('.')) {
+      normalizedReportedIp = potentialIpv4;
+    }
+  }
+  
+  const areEquivalent = inputIp === normalizedReportedIp;
+
+  if (areEquivalent) {
+    return { areEquivalent: true, displayTested: inputIp, displayReported: inputIp };
+  } else {
+    return { areEquivalent: false, displayTested: inputIp, displayReported: reportedIp };
+  }
+}
 
 function parseTraceText(text) {
   try {
